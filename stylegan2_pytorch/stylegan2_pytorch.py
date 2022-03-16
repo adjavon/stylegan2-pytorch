@@ -44,7 +44,8 @@ except:
 
 import aim
 
-assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
+# FIXME no you don't
+# assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
 
 
 # constants
@@ -420,6 +421,7 @@ class EqualLinear(nn.Module):
     def forward(self, input):
         return F.linear(input, self.weight * self.lr_mul, bias=self.bias * self.lr_mul)
 
+
 class StyleVectorizer(nn.Module):
     def __init__(self, emb, depth, lr_mul = 0.1):
         super().__init__()
@@ -433,6 +435,8 @@ class StyleVectorizer(nn.Module):
     def forward(self, x):
         x = F.normalize(x, dim=1)
         return self.net(x)
+
+
 
 class RGBBlock(nn.Module):
     def __init__(self, latent_dim, input_channel, upsample, rgba = False):
@@ -461,30 +465,63 @@ class RGBBlock(nn.Module):
 
         return x
 
+
 class Conv2DMod(nn.Module):
-    def __init__(self, in_chan, out_chan, kernel, demod=True, stride=1, dilation=1, eps = 1e-8, **kwargs):
+    """Style-modulated convolution."""
+    def __init__(self, in_chan, out_chan, kernel, demod=True, stride=1,
+                 dilation=1, eps=1e-8, **kwargs):
+        """
+        Parameters
+        ----------
+        in_chan: int
+            Number of channels in the input
+        out_chan: int
+            Number of channels in the output
+        kernel: int
+            Size of the kernel in x,y dimensions
+        demod: bool
+            Whether or not to re-scale the weights after their modulation by
+            style so that the statistics of the output match those of the input
+            Defaults to True
+        stride: int
+            Convolution stride, defaults to 1
+        dilation: int
+            Convolution dilation, defaults to 1
+        eps: float
+            A small value to avoid division by 0 during demodulation. Defaults
+            to 1e-8
+        kwargs: dict
+            Additional keyword arguments. Unused.
+        """
         super().__init__()
         self.filters = out_chan
         self.demod = demod
         self.kernel = kernel
         self.stride = stride
         self.dilation = dilation
-        self.weight = nn.Parameter(torch.randn((out_chan, in_chan, kernel, kernel)))
+        self.weight = nn.Parameter(torch.randn((out_chan, in_chan, kernel,
+                                                kernel)))
         self.eps = eps
-        nn.init.kaiming_normal_(self.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+        nn.init.kaiming_normal_(self.weight, a=0, mode='fan_in',
+                                nonlinearity='leaky_relu')
 
     def _get_same_padding(self, size, kernel, dilation, stride):
+        """Obtain value of padding given the convolution parameters so that the
+        input has the same shape as the output."""
         return ((size - 1) * (stride - 1) + dilation * (kernel - 1)) // 2
 
     def forward(self, x, y):
+        """Convolve x modulated by y."""
         b, c, h, w = x.shape
 
-        w1 = y[:, None, :, None, None]
-        w2 = self.weight[None, :, :, :, :]
-        weights = w2 * (w1 + 1)
+        w1 = y[:, None, :, None, None]  # Mixing?, o, i, k, k
+        w2 = self.weight[None, :, :, :, :]  # Mixing?, o, i, k, k
+        weights = w2 * (w1 + 1)  # Shift weights around 1
 
         if self.demod:
-            d = torch.rsqrt((weights ** 2).sum(dim=(2, 3, 4), keepdim=True) + self.eps)
+            d = torch.rsqrt(
+                    (weights ** 2).sum(dim=(2, 3, 4), keepdim=True) + self.eps
+                    )
             weights = weights * d
 
         x = x.reshape(1, -1, h, w)
@@ -498,45 +535,113 @@ class Conv2DMod(nn.Module):
         x = x.reshape(-1, self.filters, h, w)
         return x
 
-class GeneratorBlock(nn.Module):
-    def __init__(self, latent_dim, input_channels, filters, upsample = True, upsample_rgb = True, rgba = False):
-        super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False) if upsample else None
 
+class GeneratorBlock(nn.Module):
+    """One-resolution block of the StyleGAN2"""
+    def __init__(self, latent_dim, input_channels, filters,
+                 upsample=True, upsample_rgb=True, rgba=False,
+                 ind=0):
+        """
+        Parameters
+        ----------
+        latent_dim: int
+            Size of the latent vector
+        input_channels: int
+            Number of channels in the input
+        filters: int
+            Number of features in the convolutions
+        upsample: bool
+            Whether or not to upsample the input before the convolutions
+            Defaults to True.
+        upsample_rgb: bool
+            Whether or not the image needs to be upsampled before conversion to
+            RBG. Passed to RGBBlock. Defaults to True.
+        rgba: bool
+            Whether the target image is RGB (False) or RGBA (True), which
+            determines the number of channels in the target/output image.
+            Defaults to False (RGB, or 3 channels)
+        ind: int
+            Index used to define where to slice the content vector.
+        """
+        super().__init__()
+        # Content slice indices
+        # TODO Need sums :)
+        self.ind_start = int(sum([2**(2*i + 4)
+                             for i in range(ind)]))
+        self.ind_end = int(sum([2**(2*i + 4)
+                           for i in range(ind + 1)]))
+
+        # Layers
+        if upsample:
+            self.upsample = nn.Upsample(scale_factor=2, mode='bilinear',
+                                        align_corners=False)
+        else:
+            self.upsample = None
+
+        # First block
+        # StyleGAN's A: Converts w to one style per channel
         self.to_style1 = nn.Linear(latent_dim, input_channels)
+        # StyleGAN's B: Converts noise to one per channel
         self.to_noise1 = nn.Linear(1, filters)
+        # Modulated convolution in_chan, out_chan, kernel_size
         self.conv1 = Conv2DMod(input_channels, filters, 3)
-        
+
+        # Second block, same as above
         self.to_style2 = nn.Linear(latent_dim, filters)
         self.to_noise2 = nn.Linear(1, filters)
         self.conv2 = Conv2DMod(filters, filters, 3)
 
+        # Same activation for block 1 and block 2
         self.activation = leaky_relu()
+        # Skip Layer
         self.to_rgb = RGBBlock(latent_dim, filters, upsample_rgb, rgba)
 
     def forward(self, x, prev_rgb, istyle, inoise):
+        """
+        Parameters
+        ----------
+        x: torch.Tensor
+            Input from previous block
+        prev_rgv: torch.Tensor
+            Skip layer from previous block
+        istyle: torch.Tensor
+            StyleGAN's `w` style vector
+        inoise: torch.Tensor
+            Random uniform noise
+        """
         if exists(self.upsample):
             x = self.upsample(x)
 
-        inoise = inoise[:, :x.shape[2], :x.shape[3], :]
+        # Crop the noise to match this layer's size, then make two versions,
+        # one for each sub-block
+        # inoise = inoise[:, :x.shape[2], :x.shape[3], :]
+        # MINE slice and reshape
+        inoise = inoise[:, self.ind_start:self.ind_end]
+        b, _, w, h = x.shape
+        inoise = inoise.reshape((b, w, h, 1))
         noise1 = self.to_noise1(inoise).permute((0, 3, 2, 1))
         noise2 = self.to_noise2(inoise).permute((0, 3, 2, 1))
 
+        # First style injection
         style1 = self.to_style1(istyle)
         x = self.conv1(x, style1)
         x = self.activation(x + noise1)
 
+        # Second style injection
         style2 = self.to_style2(istyle)
         x = self.conv2(x, style2)
         x = self.activation(x + noise2)
 
+        # Skip layer
         rgb = self.to_rgb(x, prev_rgb, istyle)
         return x, rgb
+
 
 class DiscriminatorBlock(nn.Module):
     def __init__(self, input_channels, filters, downsample=True):
         super().__init__()
-        self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
+        self.conv_res = nn.Conv2d(input_channels, filters, 1,
+                                  stride=(2 if downsample else 1))
 
         self.net = nn.Sequential(
             nn.Conv2d(input_channels, filters, 3, padding=1),
@@ -547,7 +652,7 @@ class DiscriminatorBlock(nn.Module):
 
         self.downsample = nn.Sequential(
             Blur(),
-            nn.Conv2d(filters, filters, 3, padding = 1, stride = 2)
+            nn.Conv2d(filters, filters, 3, padding=1, stride=2)
         ) if downsample else None
 
     def forward(self, x):
@@ -558,63 +663,128 @@ class DiscriminatorBlock(nn.Module):
         x = (x + res) * (1 / math.sqrt(2))
         return x
 
+
 class Generator(nn.Module):
-    def __init__(self, image_size, latent_dim, network_capacity = 16, transparent = False, attn_layers = [], no_const = False, fmap_max = 512):
+    def __init__(self, image_size, latent_dim, network_capacity=16,
+                 transparent=False, attn_layers=[], no_const=False,
+                 fmap_max=512):
+        """StyleGAN2 Generator with skip layers to 'RGB'.
+
+        Parameters
+        ----------
+        image_size: int
+            X,Y size of the image, assumed square
+        latent_dim: int
+            Size of the style vector `w` passed to the generator's forward
+            function
+        network_capacity: int
+            Scaling factor for the number of features in each layer of the
+            network. Defaults to 16.
+            Layer `i` (0-indexed) will have `network_capacity * (2**(i+1))`
+            features.
+        transparent: bool
+            Whether the input image is in RGB (False???) or RGBA (True??)
+            representation. Determines the number of channels required in the
+            generated images.
+            Defaults to False
+        attn_layers: List[int]
+            Layers at which to use attention.
+            Defaults to [] (oh no...)
+        no_const: bool
+            Whether or not to have a Constant-valued input to the network. If
+            not, the average style value is transformed into a network.
+            Defaults to False
+        fmap_max: int
+            Maximum number of feature maps in any given layer. Overrides the
+            value set by `network_capacity`. Defaults to 512.
+        """
         super().__init__()
         self.image_size = image_size
         self.latent_dim = latent_dim
         self.num_layers = int(log2(image_size) - 1)
 
-        filters = [network_capacity * (2 ** (i + 1)) for i in range(self.num_layers)][::-1]
+        filters = [network_capacity * (2 ** (i + 1))
+                   for i in range(self.num_layers)][::-1]
 
-        set_fmap_max = partial(min, fmap_max)
+        set_fmap_max = partial(min, fmap_max)  # ~ lambda x: min(x, fmap_max)
         filters = list(map(set_fmap_max, filters))
         init_channels = filters[0]
+        # TODO Why filters[0] in there twice?
         filters = [init_channels, *filters]
 
         in_out_pairs = zip(filters[:-1], filters[1:])
         self.no_const = no_const
 
+        # Defines the initial input to the network, either as a constant or as
+        # a transformation of the average style value across the batch.
         if no_const:
-            self.to_initial_block = nn.ConvTranspose2d(latent_dim, init_channels, 4, 1, 0, bias=False)
+            # Takes a 1x1 and turns it to a 4x4
+            self.to_initial_block = nn.ConvTranspose2d(latent_dim,
+                                                       init_channels,
+                                                       kernel_size=4,
+                                                       stride=1,
+                                                       padding=0,
+                                                       bias=False)
         else:
-            self.initial_block = nn.Parameter(torch.randn((1, init_channels, 4, 4)))
+            self.initial_block = nn.Parameter(torch.randn((1, init_channels,
+                                                           4, 4)))
 
         self.initial_conv = nn.Conv2d(filters[0], filters[0], 3, padding=1)
         self.blocks = nn.ModuleList([])
         self.attns = nn.ModuleList([])
 
+        # Create the layers
         for ind, (in_chan, out_chan) in enumerate(in_out_pairs):
             not_first = ind != 0
             not_last = ind != (self.num_layers - 1)
             num_layer = self.num_layers - ind
 
-            attn_fn = attn_and_ff(in_chan) if num_layer in attn_layers else None
-
+            # TODO Can attention safely be ignored?
+            if num_layer in attn_layers:
+                attn_fn = attn_and_ff(in_chan)
+            else:
+                attn_fn = None
             self.attns.append(attn_fn)
 
+            # StyleGAN block.
+            # If this is the first layer, then no upsamplng, else yes
+            # If this is this is not the last, the output needs to be
+            # upsampled to match the skip layer, else
             block = GeneratorBlock(
                 latent_dim,
                 in_chan,
                 out_chan,
-                upsample = not_first,
-                upsample_rgb = not_last,
-                rgba = transparent
+                upsample=not_first,
+                upsample_rgb=not_last,
+                rgba=transparent,
+                ind=ind  # TODO added this to get the shape
             )
             self.blocks.append(block)
 
     def forward(self, styles, input_noise):
+        """Generates an (RGB) image from style and noise.
+
+        Parameters
+        ----------
+        styles: torch.Tensor
+            Shape of style is (batch, ???, latent_dims)
+        """
         batch_size = styles.shape[0]
-        image_size = self.image_size
 
         if self.no_const:
+            # Generates an input to the network from the average style
             avg_style = styles.mean(dim=1)[:, :, None, None]
+            # Takes the 1x1 style and converts it to a 4x4 input image
             x = self.to_initial_block(avg_style)
         else:
+            # Repeat the constant batch_size number of times in that dimension
             x = self.initial_block.expand(batch_size, -1, -1, -1)
 
         rgb = None
+        # TODO Why swap batch and ?? dimension
+        # TODO Is dimension 1 (soon to be 0) used for style-mixing?
         styles = styles.transpose(0, 1)
+        # Creates the right number of features to begin with
         x = self.initial_conv(x)
 
         for style, block, attn in zip(styles, self.blocks, self.attns):
@@ -623,6 +793,7 @@ class Generator(nn.Module):
             x, rgb = block(x, rgb, style, input_noise)
 
         return rgb
+
 
 class Discriminator(nn.Module):
     def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512):
@@ -901,7 +1072,7 @@ class Trainer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity}
-        
+
     def init_GAN(self):
         args, kwargs = self.GAN_params
         self.GAN = StyleGAN2(lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, image_size = self.image_size, network_capacity = self.network_capacity, fmap_max = self.fmap_max, transparent = self.transparent, fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, *args, **kwargs)
@@ -1165,7 +1336,7 @@ class Trainer():
         self.GAN.eval()
         ext = self.image_extension
         num_rows = self.num_image_tiles
-    
+
         latent_dim = self.GAN.G.latent_dim
         image_size = self.GAN.G.image_size
         num_layers = self.GAN.G.num_layers
@@ -1179,7 +1350,7 @@ class Trainer():
 
         generated_images = self.generate_truncated(self.GAN.S, self.GAN.G, latents, n, trunc_psi = self.trunc_psi)
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
-        
+
         # moving averages
 
         generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
@@ -1270,7 +1441,7 @@ class Trainer():
     def truncate_style_defs(self, w, trunc_psi = 0.75):
         w_space = []
         for tensor, num_layers in w:
-            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)            
+            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)
             w_space.append((tensor, num_layers))
         return w_space
 
@@ -1307,11 +1478,11 @@ class Trainer():
             generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
             images_grid = torchvision.utils.make_grid(generated_images, nrow = num_rows)
             pil_image = transforms.ToPILImage()(images_grid.cpu())
-            
+
             if self.transparent:
                 background = Image.new("RGBA", pil_image.size, (255, 255, 255))
                 pil_image = Image.alpha_composite(background, pil_image)
-                
+
             frames.append(pil_image)
 
         frames[0].save(str(self.results_dir / self.name / f'{str(num)}.gif'), save_all=True, append_images=frames[1:], duration=80, loop=0, optimize=True)
