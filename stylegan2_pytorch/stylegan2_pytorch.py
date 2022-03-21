@@ -437,18 +437,16 @@ class StyleVectorizer(nn.Module):
         return self.net(x)
 
 
-
 class RGBBlock(nn.Module):
-    def __init__(self, latent_dim, input_channel, upsample, rgba = False):
+    def __init__(self, latent_dim, input_channel, upsample, out_channels=3):
         super().__init__()
         self.input_channel = input_channel
         self.to_style = nn.Linear(latent_dim, input_channel)
 
-        out_filters = 3 if not rgba else 4
-        self.conv = Conv2DMod(input_channel, out_filters, 1, demod=False)
+        self.conv = Conv2DMod(input_channel, out_channels, 1, demod=False)
 
         self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor = 2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             Blur()
         ) if upsample else None
 
@@ -529,7 +527,8 @@ class Conv2DMod(nn.Module):
         _, _, *ws = weights.shape
         weights = weights.reshape(b * self.filters, *ws)
 
-        padding = self._get_same_padding(h, self.kernel, self.dilation, self.stride)
+        padding = self._get_same_padding(h, self.kernel, self.dilation,
+                                         self.stride)
         x = F.conv2d(x, weights, padding=padding, groups=b)
 
         x = x.reshape(-1, self.filters, h, w)
@@ -539,7 +538,7 @@ class Conv2DMod(nn.Module):
 class GeneratorBlock(nn.Module):
     """One-resolution block of the StyleGAN2"""
     def __init__(self, latent_dim, input_channels, filters,
-                 upsample=True, upsample_rgb=True, rgba=False,
+                 upsample=True, upsample_rgb=True, out_channels=3,
                  ind=0):
         """
         Parameters
@@ -556,16 +555,14 @@ class GeneratorBlock(nn.Module):
         upsample_rgb: bool
             Whether or not the image needs to be upsampled before conversion to
             RBG. Passed to RGBBlock. Defaults to True.
-        rgba: bool
-            Whether the target image is RGB (False) or RGBA (True), which
-            determines the number of channels in the target/output image.
-            Defaults to False (RGB, or 3 channels)
+        out_channels: int
+            Determines the number of channels in the target/output image.
+            Defaults to 3 channels (RGB)
         ind: int
             Index used to define where to slice the content vector.
         """
         super().__init__()
         # Content slice indices
-        # TODO Need sums :)
         self.ind_start = int(sum([2**(2*i + 4)
                              for i in range(ind)]))
         self.ind_end = int(sum([2**(2*i + 4)
@@ -594,7 +591,7 @@ class GeneratorBlock(nn.Module):
         # Same activation for block 1 and block 2
         self.activation = leaky_relu()
         # Skip Layer
-        self.to_rgb = RGBBlock(latent_dim, filters, upsample_rgb, rgba)
+        self.to_rgb = RGBBlock(latent_dim, filters, upsample_rgb, out_channels)
 
     def forward(self, x, prev_rgb, istyle, inoise):
         """
@@ -666,7 +663,7 @@ class DiscriminatorBlock(nn.Module):
 
 class Generator(nn.Module):
     def __init__(self, image_size, latent_dim, network_capacity=16,
-                 transparent=False, attn_layers=[], no_const=False,
+                 out_channels=3, attn_layers=[], no_const=False,
                  fmap_max=512):
         """StyleGAN2 Generator with skip layers to 'RGB'.
 
@@ -682,11 +679,9 @@ class Generator(nn.Module):
             network. Defaults to 16.
             Layer `i` (0-indexed) will have `network_capacity * (2**(i+1))`
             features.
-        transparent: bool
-            Whether the input image is in RGB (False???) or RGBA (True??)
-            representation. Determines the number of channels required in the
-            generated images.
-            Defaults to False
+        out_channels: int
+            Determines the number of channels required in the generated images.
+            Defaults to 3
         attn_layers: List[int]
             Layers at which to use attention.
             Defaults to [] (oh no...)
@@ -756,8 +751,8 @@ class Generator(nn.Module):
                 out_chan,
                 upsample=not_first,
                 upsample_rgb=not_last,
-                rgba=transparent,
-                ind=ind  # TODO added this to get the shape
+                out_channels=out_channels,
+                ind=ind
             )
             self.blocks.append(block)
 
